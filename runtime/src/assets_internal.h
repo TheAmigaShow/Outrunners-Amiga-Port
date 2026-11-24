@@ -30,7 +30,7 @@ const char *assets_path(const char *folder, const char *path);
 /* The media of the assets (assets_media.c): the tilesets, the sprite sheets, the MultiPCM's samples and
    their headers; false with assets_problem set when one cannot be read */
 int assets_read_tilesets(const char *folder);
-int assets_read_sprites(const char *folder);
+int assets_read_sprites(const char *folder, void (*progress)(const char *));
 int assets_read_samples(const char *folder);
 
 /* The driver's bytes of a sound program's sequence in a MIDI file (assets_midi.c, the way back of

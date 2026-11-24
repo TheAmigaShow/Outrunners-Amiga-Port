@@ -40,10 +40,20 @@ typedef struct
 	uint32_t tile_count;
 	uint32_t (*sprite_word)(uint32_t place);
 	uint32_t sprite_banks;                  /* of 1M words */
+	/* Optional direct view of contiguous host-order ROM words in one bank.
+	   Return NULL for a hole, a block boundary or a bank wrap. */
+	const uint32_t *(*sprite_span)(uint32_t first, unsigned length);
 } s32_graphics;
 
 /* Hooks the video to s32_board, drawing with 'graphics' (kept by the caller) */
 void s32_video_init_graphics(const s32_graphics *graphics);
+
+/* Enable paired sampling in the packed display path. The port identifies decorative
+   ROM frames by their original banked word address. NULL restores exact sampling. */
+void s32_video_set_scenery_filter(bool (*eligible)(uint32_t));
+
+/* Duplicate vertically sampled rows on large sprites accepted by the scenery filter. */
+void s32_video_pair_scenery_rows(bool enabled);
 
 /* The same from the chips' images, for the tools that read the ROM set (the reference, the scaffold): the
    tile ROM (16x16 tiles, 128 bytes each) and the sprite ROMs (32-bit words, big endian), as game/data.h
@@ -53,6 +63,13 @@ void s32_video_init(const uint8_t *tiles, size_t tiles_size, const uint8_t *spri
 /* What the board calls (s32_video_init sets them): the sprite commands, and the start of VBLANK */
 void s32_video_sprites(bool erase, bool draw);
 void s32_video_draw_frame(void);
+
+/* Single-screen, 320-wide packed output supplied by the display backend. NULL
+   selects the regular RGB frame. Half scenery samples only the four tilemaps. */
+typedef enum {
+	S32_RGB332, S32_RGB565, S32_BGR565, S32_RGB565_SWAP, S32_BGR565_SWAP
+} s32_packed_format;
+void s32_video_set_output(void *buffer, s32_packed_format format, bool half_scenery);
 
 /* The last frame of screen 0 (left) or 1 (right): S32_VIDEO_MAX_WIDTH pixels a row, S32_VIDEO_HEIGHT rows;
    its width is 320 or 416 */

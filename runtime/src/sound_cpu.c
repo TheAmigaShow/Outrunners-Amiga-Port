@@ -36,13 +36,14 @@
 /* the board's time when the Z80 has run 'cycles' */
 static uint64_t board_time(uint64_t cycles)
 {
-	return cycles * S32_CPU_CLOCK / S32_SOUND_CLOCK;
+	_Static_assert(2 * S32_CPU_CLOCK == 5 * S32_SOUND_CLOCK, "Multi 32 board to Z80 clock ratio");
+	return cycles * 2 + cycles / 2;
 }
 
 /* the first Z80 cycle at or after the board's 'time' */
 static uint64_t z80_time(uint64_t time)
 {
-	return (time * S32_SOUND_CLOCK + S32_CPU_CLOCK - 1) / S32_CPU_CLOCK;
+	return time / 5 * 2 + ((unsigned)(time % 5) * 2 + 4) / 5;
 }
 
 /* the sound program's ways in (sound_symbols.txt) */
@@ -64,9 +65,12 @@ static struct
 
 void z80_block(int cycles, int fetches)
 {
+	uint64_t time;
 	for (;;)
 	{
-		sound_chips_timers_due(board_time(z80.clock));
+		time = board_time(z80.clock);
+		if (time >= sound_next_timer)
+			sound_chips_timers_due(time);
 		if (!z80.interrupts || z80.after_ei || !z80.line)
 			break;
 		z80.interrupts = false;
@@ -75,7 +79,7 @@ void z80_block(int cycles, int fetches)
 		sound_irq();
 	}
 	z80.after_ei = false;
-	s32_board.sound_cycles = board_time(z80.clock);
+	s32_board.sound_cycles = time;
 	z80.clock += (uint64_t)cycles;
 	z80.block_refresh = z80.refresh;
 	z80.refresh += (uint32_t)fetches;
@@ -203,6 +207,7 @@ static void on_sound_reset(bool held)
 {
 	if (held)
 	{
+		if (sound_music_command) sound_music_command(0, 0x1f);
 		z80.running = false;
 		z80.interrupts = false;
 		z80.after_ei = false;

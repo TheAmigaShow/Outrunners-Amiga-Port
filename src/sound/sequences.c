@@ -10,6 +10,13 @@
  *    tools/decompile_sound.py, with the names of sound_symbols.txt.
  */
 #include "sound.h"
+#include "sound/chips.h"
+
+bool (*sound_music_command)(unsigned, uint8_t);
+void (*sound_music_fade)(unsigned, uint8_t);
+void (*sound_song_started)(unsigned, uint8_t, uint16_t);
+void (*sound_command_seen)(unsigned, uint8_t);
+static bool recorded_music[2];
 
 /* The sequence players' step, on every timer tick: screen_1_tick_countdown runs 4 to 1 and picks a
    group, each stepped once in four ticks (step_player): at its wrap screen 2's seven effect players
@@ -337,6 +344,7 @@ uint16_t step_player(uint16_t queue_pointer, uint16_t player_address, uint16_t p
 			else
 			{
 				z80_block(28, 4);
+				const uint8_t event_start = write_index;
 				queued_byte = status;
 				status &= ~0xFu;
 				if (status == 0xF0u)
@@ -491,6 +499,13 @@ uint16_t step_player(uint16_t queue_pointer, uint16_t player_address, uint16_t p
 						}
 					}
 				}
+				if ((status == 0x80 || status == 0x90) && sound_music_command
+					&& (player_address == SEQUENCE_PLAYER_ADDRESS(0) || player_address == SEQUENCE_PLAYER_ADDRESS(8))
+					&& recorded_music[player_address == SEQUENCE_PLAYER_ADDRESS(8)])
+				{
+					write_index = event_start;
+					SCREEN_PAGE(page)->midi_count--;
+				}
 			}
 			z80_block(30, 3);
 			if (((SEQUENCE_PLAYER(player)->flags >> 6) & 1u) != 0u)
@@ -644,6 +659,7 @@ void take_sound_command(uint16_t player_address, uint16_t page, uint8_t command)
 {
 	z80_block(10, 1);
 	SCREEN_PAGE(page)->command = 0u;
+	if (sound_command_seen) sound_command_seen(page == SCREEN_PAGE_ADDRESS(1), command);
 	start_sound(player_address, command);
 }
 
@@ -671,6 +687,12 @@ void start_sound(uint16_t player_address, uint8_t command)
 	header = command_header;
 	sequence_player = swapped_player;
 	header_flags = z80_read8(header);
+	if (sound_music_command && !(header_flags & 0x80)
+		&& (player_address == SEQUENCE_PLAYER_ADDRESS(0) || player_address == SEQUENCE_PLAYER_ADDRESS(8)))
+	{
+		const unsigned screen = player_address == SEQUENCE_PLAYER_ADDRESS(8);
+		recorded_music[screen] = sound_music_command(screen, command);
+	}
 	if (header_flags >> 7 != 0u)
 	{
 		z80_block(18, 3);
@@ -775,6 +797,11 @@ void start_song(uint16_t player, uint8_t song)
 	uint16_t swapped_player = 0;
 
 	z80_block(27, 2);
+	if (sound_song_started)
+	{
+		const struct sequence_player *sequence = SEQUENCE_PLAYER(player & 0xff00);
+		sound_song_started(player & 0xff00, song, sequence->playlist_low | sequence->playlist_high << 8);
+	}
 	song_record = songs_ADDRESS;
 	song_record = read_table_word(song_record, song);
 	z80_block(21, 3);
@@ -865,6 +892,8 @@ uint16_t fade_music_volume(uint16_t queue_pointer, uint16_t player, uint16_t pag
 	z80_block(39, 5);
 	sequence_player = IN_PAGE(sequence_player, 0x15u);
 	SEQUENCE_PLAYER(sequence_player - 0x15u)->fade_volume--;
+	if (sound_music_fade)
+		sound_music_fade(page == SCREEN_PAGE_ADDRESS(1), SEQUENCE_PLAYER(sequence_player - 0x15u)->fade_volume);
 	if (SEQUENCE_PLAYER(sequence_player - 0x15u)->fade_volume == 0u)
 	{
 		z80_block(223, 31);

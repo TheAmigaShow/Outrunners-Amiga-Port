@@ -464,7 +464,7 @@ static int typed_value(writer *into, const char *token, const char *type)
 		value = strtoll(token, NULL, 0);
 	else if ((value = address_of_name(token)) < 0)
 	{
-		snprintf(assets_problem, sizeof(assets_problem), "the asset %s names %s, which the game does not know", into->piece, token);
+		snprintf(assets_problem, sizeof(assets_problem), "the asset %s uses unknown name %s (check %s/names.txt)", into->piece, token, reading->folder);
 		return 0;
 	}
 	if (is_signed ? (value < -((int64_t)1 << (bytes * 8 - 1)) || value >= ((int64_t)1 << (bytes * 8 - 1)))
@@ -585,15 +585,11 @@ static int column_value(writer *into, const char *token, const typed_column *col
 }
 
 /* A record of 'shape' from the rest of the line at 'at' (its values, the fixed columns left out) */
-static int typed_record(writer *into, const char **at, const typed_shape *shape, const char *first)
+static int typed_record(writer *into, const char **at, const typed_shape *shape, char *token, size_t room, int have)
 {
-	char token[4096];
 	const uint32_t start = into->at;
 	int column = 0;
-	int have = first != NULL;
 
-	if (have)
-		strcpy(token, first);
 	for (; column < shape->count; column++)
 	{
 		const typed_column *current = &shape->columns[column];
@@ -618,13 +614,13 @@ static int typed_record(writer *into, const char **at, const typed_shape *shape,
 				return 0;
 			continue;
 		}
-		if (!have && !next_token(at, token, sizeof(token)))
+		if (!have && !next_token(at, token, room))
 			break;
 		have = 0;
 		if (!column_value(into, token, current))
 			return 0;
 	}
-	if (column != shape->count || next_token(at, token, sizeof(token)) || (shape->size && into->at - start != shape->size))
+	if (column != shape->count || next_token(at, token, room) || (shape->size && into->at - start != shape->size))
 	{
 		snprintf(assets_problem, sizeof(assets_problem), "the asset %s has a record that is not as its layout says", into->piece);
 		return 0;
@@ -635,7 +631,7 @@ static int typed_record(writer *into, const char **at, const typed_shape *shape,
 static int typed_values(writer *into, const char *body)
 {
 	static typed_shape current, kinds[MAX_KINDS];
-	char token[4096];
+	static char token[4096];
 	int kind_count = 0;
 	int have_layout = 0;
 
@@ -692,7 +688,7 @@ static int typed_values(writer *into, const char *body)
 			;
 		if (kind < kind_count)
 		{
-			if (!typed_record(into, &at, &kinds[kind], NULL))
+			if (!typed_record(into, &at, &kinds[kind], token, sizeof(token), 0))
 				return 0;
 			continue;
 		}
@@ -711,7 +707,7 @@ static int typed_values(writer *into, const char *body)
 			while (next_token(&at, token, sizeof(token)));
 			continue;
 		}
-		if (!typed_record(into, &at, &current, token))
+		if (!typed_record(into, &at, &current, token, sizeof(token), 1))
 			return 0;
 	}
 	return 1;
@@ -1156,15 +1152,27 @@ int assets_pack_read_data(pack_reader *reader)
 
 const char *assets_load(const char *folder)
 {
+	return assets_load_with_progress(folder, NULL);
+}
+
+const char *assets_load_with_progress(const char *folder, void (*progress)(const char *))
+{
 	assets_problem[0] = 0;
-	if (!read_region(folder, &program) || !read_region(folder, &sound))
+	if (progress) progress("Loading game data");
+	int ok = read_region(folder, &program);
+	if (ok)
 	{
-		forget_files();
-		return assets_problem;
+		if (progress) progress("Loading sound program data");
+		ok = read_region(folder, &sound);
 	}
 	forget_files();
-	if (!assets_read_tilesets(folder) || !assets_read_sprites(folder) || !assets_read_samples(folder))
-		return assets_problem;
+	if (!ok) return assets_problem;
+	if (progress) progress("Loading tiles");
+	if (!assets_read_tilesets(folder)) return assets_problem;
+	if (progress) progress("Loading sprite sheets");
+	if (!assets_read_sprites(folder, progress)) return assets_problem;
+	if (progress) progress("Loading sound samples");
+	if (!assets_read_samples(folder)) return assets_problem;
 	for (size_t index = 0; index < game_table_count; index++)
 	{
 		const uint8_t *found = find(&program, folded(game_tables[index].address));

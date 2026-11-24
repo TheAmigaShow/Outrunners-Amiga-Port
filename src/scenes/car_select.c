@@ -323,9 +323,11 @@ void CONSOLE_ORIGINAL(car_select_run)(void)
 				return;
 			}
 		}
+#ifndef ORUNNERS_AMIGA
 		object = start_object();
 		object->handler = waiting_banner_show_ADDRESS;
 		object->waiting_banner.car_select = address_of(current_object);
+#endif
 		current_object->car_select.transmission_chosen = 0xFFu;
 		current_object->state++;
 	case 6:

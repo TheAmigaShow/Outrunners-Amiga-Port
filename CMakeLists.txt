@@ -5,7 +5,12 @@
 # Modified:    13-11-2026
 # Author:      Sebastian Toyos
 cmake_minimum_required(VERSION 3.20)
-project(outrunners VERSION 1.3.2 LANGUAGES C CXX)    # (the release's: OPTIONS shows it, the devices' packages carry it)
+option(ORUNNERS_AMIGA "Build the single-player AmigaOS 3 port" OFF)
+if(ORUNNERS_AMIGA)
+	project(outrunners VERSION 1.3.2 LANGUAGES C ASM)
+else()
+	project(outrunners VERSION 1.3.2 LANGUAGES C CXX)
+endif()    # (the release's: OPTIONS shows it, the devices' packages carry it)
 
 # A generator of one configuration (Makefiles, Ninja: Linux's and macOS's by default) given no build type
 # builds the game optimized, as the packages are: without, it is slower (and issue 17's race showed)
@@ -93,11 +98,19 @@ add_library(s32runtime STATIC
 	runtime/src/ym3438.c
 	runtime/src/memory_census.c
 	runtime/src/tasks.c
-	runtime/src/video.c
-	runtime/src/workers.c
 	runtime/src/multipcm.c
 	runtime/src/sound_chips.c
 )
+# M10 links its renderer directly into the executable in release link order.
+if(NOT ORUNNERS_AMIGA OR NOT ORUNNERS_AMIGA_CPU STREQUAL "68060")
+	target_sources(s32runtime PRIVATE runtime/src/video.c)
+endif()
+if(ORUNNERS_AMIGA)
+	target_sources(s32runtime PRIVATE ports/amiga/workers.c ports/amiga/stacks.S)
+	target_compile_definitions(s32runtime PRIVATE ORUNNERS_AMIGA)
+else()
+	target_sources(s32runtime PRIVATE runtime/src/workers.c)
+endif()
 if(ORUNNERS_BYTE_ORDER_CHECK)
 	target_sources(s32runtime PRIVATE runtime/src/byte_order.c)
 endif()
@@ -110,7 +123,7 @@ set(ORUNNERS_SWITCH OFF)
 if(NINTENDO_SWITCH OR CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
 	set(ORUNNERS_SWITCH ON)
 endif()
-if(UNIX AND NOT ORUNNERS_SWITCH)
+if(UNIX AND NOT ORUNNERS_SWITCH AND NOT ORUNNERS_AMIGA)
 	find_package(Threads REQUIRED)
 	target_link_libraries(s32runtime PUBLIC Threads::Threads)
 endif()
@@ -202,6 +215,54 @@ if(ORUNNERS_DECOMPILED AND ORUNNERS_SOUND_DECOMPILED)
 		target_compile_options(orunners_game PRIVATE ${ORUNNERS_GAME_GCC_OPTIONS})
 	endif()
 
+	if(ORUNNERS_AMIGA)
+		target_compile_definitions(orunners_game PRIVATE ORUNNERS_AMIGA)
+		find_program(ORUNNERS_VASM vasmm68k_mot REQUIRED)
+		if(NOT DEFINED ORUNNERS_AMIGA_CPU)
+			set(ORUNNERS_AMIGA_CPU 68030)
+		endif()
+		execute_process(COMMAND ${CMAKE_C_COMPILER} -print-file-name=libc.a
+			OUTPUT_VARIABLE ORUNNERS_AMIGA_LIBC OUTPUT_STRIP_TRAILING_WHITESPACE)
+		get_filename_component(ORUNNERS_AMIGA_LIBDIR "${ORUNNERS_AMIGA_LIBC}" DIRECTORY)
+		if(ORUNNERS_AMIGA_CPU STREQUAL "68060")
+			set(ORUNNERS_KALMS_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/ports/amiga/c2p1x1_8_c5_040.s)
+		else()
+			set(ORUNNERS_KALMS_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/ports/amiga/c2p1x1_8_c5_030.s)
+		endif()
+		set(ORUNNERS_KALMS_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/kalms.o)
+		add_custom_command(OUTPUT ${ORUNNERS_KALMS_OBJECT}
+			COMMAND ${ORUNNERS_VASM} -quiet -m${ORUNNERS_AMIGA_CPU} -Fhunk
+				-I${ORUNNERS_AMIGA_LIBDIR}/../ndk-include
+				-o ${ORUNNERS_KALMS_OBJECT} ${ORUNNERS_KALMS_SOURCE}
+			DEPENDS ${ORUNNERS_KALMS_SOURCE}
+			VERBATIM)
+		set(AMIGA_MAIN ports/amiga/main.c)
+		if(ORUNNERS_AMIGA_CPU STREQUAL "68060")
+			set(AMIGA_MAIN ports/amiga/main-m10.c)
+			add_executable(Pad4Setup ports/amiga/setup.c)
+			add_executable(Pad4Audio ports/amiga/auto_audio.c)
+			foreach(helper IN ITEMS Pad4Setup Pad4Audio)
+				target_compile_options(${helper} PRIVATE -Os)
+				target_link_options(${helper} PRIVATE -s)
+			endforeach()
+		endif()
+		add_executable(OutRunners ${AMIGA_MAIN} ports/amiga/loading.c ports/amiga/chime_trace.c ports/amiga/opening_trace.c ports/amiga/audio.c ports/amiga/music.c ports/amiga/ima.c ports/amiga/display.c ports/amiga/memory.c ${ORUNNERS_KALMS_OBJECT})
+		if(ORUNNERS_AMIGA_CPU STREQUAL "68060")
+			target_sources(OutRunners PRIVATE runtime/src/video.c)
+			set_source_files_properties(runtime/src/video.c PROPERTIES COMPILE_DEFINITIONS ORUNNERS_AMIGA)
+		endif()
+		target_link_libraries(OutRunners PRIVATE orunners_game orunners_sound m)
+		foreach(target IN ITEMS OutRunners orunners_game orunners_sound s32runtime)
+			target_compile_options(${target} PRIVATE
+				"$<$<COMPILE_LANGUAGE:C>:-include${CMAKE_CURRENT_SOURCE_DIR}/ports/amiga/game_heap.h>")
+		endforeach()
+		return()
+	endif()
+
+	if(NOT CMAKE_CROSSCOMPILING)
+		add_executable(orunners_amiga_music EXCLUDE_FROM_ALL ports/amiga/render_music.c)
+		target_link_libraries(orunners_amiga_music PRIVATE orunners_game orunners_sound)
+	endif()
 	add_executable(orunners_game_headless ports/headless/main.c)
 	target_link_libraries(orunners_game_headless PRIVATE orunners_game orunners_sound)
 

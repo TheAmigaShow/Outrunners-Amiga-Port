@@ -22,6 +22,7 @@
 #include "s32/ym3438.h"
 #include "s32/byte_order.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -60,6 +61,15 @@ static struct
 	size_t mix_frames;
 } sound = { .override = NO_TIMER };
 
+static bool pcm_playback;
+static const int8_t *compact_bank;
+static multipcm_compact compact_pcm;
+static unsigned wide_channels;
+static int32_t *wide_mix;
+static size_t wide_capacity;
+static int32_t compressor_gain;     /* Q14, linked across both speakers */
+static uint64_t mixed_until;  /* output sample number at the last frame boundary */
+
 static bool sides_together;    /* sound_chips_join_sides */
 
 static uint64_t now(void)
@@ -91,6 +101,16 @@ static void fm_catch_up(uint64_t time)
 	const uint64_t due = (time + FM_PERIOD - 1) / FM_PERIOD;
 	int32_t out[2];
 
+	if (pcm_playback)
+	{
+		/* Timer B uses the low four bits of the free-running sample clock. */
+		if (due > sound.fm_samples)
+		{
+			sound.fm.total_clocks += (uint8_t)(due - sound.fm_samples);
+			sound.fm_samples = due;
+		}
+		return;
+	}
 	while (sound.fm_samples < due)
 	{
 		s32_fm_generate(&sound.fm, out);
@@ -99,10 +119,18 @@ static void fm_catch_up(uint64_t time)
 	}
 }
 
+uint64_t sound_next_timer = NO_TIMER;
+
+static void set_deadline(int timer, uint64_t deadline)
+{
+	sound.deadline[timer] = deadline;
+	sound_next_timer = deadline < sound.deadline[timer ^ 1] ? deadline : sound.deadline[timer ^ 1];
+}
+
 static void fm_set_timer(void *opaque, int timer, int32_t clocks)
 {
 	(void)opaque;
-	sound.deadline[timer] = clocks < 0 ? NO_TIMER : now() + fm_span((uint64_t)clocks);
+	set_deadline(timer, clocks < 0 ? NO_TIMER : now() + fm_span((uint64_t)clocks));
 }
 
 static void fm_update_irq(void *opaque, bool asserted)
@@ -126,20 +154,15 @@ static bool fm_is_busy(void *opaque)
 	return now() < sound.busy_until;
 }
 
-static uint64_t fm_next_timer(void)
-{
-	return sound.deadline[0] < sound.deadline[1] ? sound.deadline[0] : sound.deadline[1];
-}
-
 void sound_chips_timers_due(uint64_t time)
 {
 	/* the timers due by 'time', in the order they run out */
-	while (fm_next_timer() <= time)
+	while (sound_next_timer <= time && sound_next_timer != NO_TIMER)
 	{
 		const int timer = sound.deadline[0] <= sound.deadline[1] ? 0 : 1;
 		const uint64_t when = sound.deadline[timer];
 
-		sound.deadline[timer] = NO_TIMER;
+		set_deadline(timer, NO_TIMER);
 		fm_catch_up(when);
 		sound.override = when;
 		s32_fm_timer_expired(&sound.fm, timer);
@@ -170,8 +193,16 @@ static void pcm_catch_up(uint64_t time)
 	{
 		const int count = due - sound.pcm_samples > 256 ? 256 : (int)(due - sound.pcm_samples);
 
-		multipcm_generate(&sound.pcm, first, second, count);
-		for (int index = 0; index < count; index++)
+		int produced = count;
+		if (compact_bank)
+		{
+			compact_pcm.page[2] = compact_bank + (s32_board.pcm_bank & 7u) * 0x40000;
+			compact_pcm.page[3] = compact_bank + ((s32_board.pcm_bank >> 3) & 7u) * 0x40000;
+			produced = multipcm_generate_compact(&sound.pcm, &compact_pcm, first, second, count);
+		}
+		else
+			multipcm_generate(&sound.pcm, first, second, count);
+		for (int index = 0; index < produced; index++)
 			append(&sound.pcm_buffer, first[index], second[index]);
 		sound.pcm_samples += (uint64_t)count;
 	}
@@ -183,9 +214,19 @@ static uint8_t pcm_read(int offset)
 	return multipcm_read(&sound.pcm);
 }
 
+void (*sound_pcm_write_seen)(uint64_t, unsigned, unsigned, uint8_t);
+
 static void pcm_write(int offset, uint8_t data)
 {
-	pcm_catch_up(now());
+	/* Voice and register selectors have no audible effect until a data write. */
+	if (offset == 0)
+	{
+		const uint64_t time = now();
+		pcm_catch_up(time);
+		const unsigned reg = sound.pcm.address;
+		if (sound_pcm_write_seen && sound.pcm.current_voice >= 0 && reg >= 1 && reg <= 5)
+			sound_pcm_write_seen(time, sound.pcm.current_voice, reg, data);
+	}
 	multipcm_write(&sound.pcm, offset, data);
 }
 
@@ -280,12 +321,124 @@ static void mix(void)
 	sound.mix_frames = frames;
 }
 
+/* Ceil(time * 22050 / 20000000), with a bounded 32-bit remainder. */
+uint64_t sound_pcm22_sample_at(uint64_t time)
+{
+	return time / 400000u * 441u + ((uint32_t)(time % 400000u) * 441u + 399999u) / 400000u;
+}
+
+void sound_compress_pair(int32_t *gain, int16_t *out, int32_t left, int32_t right)
+{
+	const int32_t peak = abs(left) > abs(right) ? abs(left) : abs(right);
+	if (*gain == 16384 && peak <= 16384)
+	{
+		out[0] = (int16_t)left;
+		out[1] = (int16_t)right;
+		return;
+	}
+	int32_t target = 16384;
+	if (peak > 16384)
+	{
+		/* Halve the amplitude excursion above half scale. Leave room for 8-bit rounding. */
+		int32_t level = 16384 + (peak - 16384) / 2;
+		if (level > 32512) level = 32512;
+		target = (level << 14) / peak;
+	}
+	/* Immediate attack. Release towards unity over about 46 ms at 22.05 kHz. */
+	(*gain) += (16384 - (*gain) + 1023) >> 10;
+	if ((*gain) > target) (*gain) = target;
+	out[0] = (int16_t)((left * (*gain)) >> 14);
+	out[1] = (int16_t)((right * (*gain)) >> 14);
+}
+
+/* The board sends PCM at 35% gain. Keep the wide PCM22 sum through the compressor. */
+static void mix_pcm_playback(uint64_t time)
+{
+	sample_buffer *buffer = &sound.pcm_buffer;
+	const uint64_t pcm_due = compact_bank ? sound_pcm22_sample_at(time) : (time + PCM_PERIOD - 1) / PCM_PERIOD;
+	const uint64_t out_due = compact_bank ? pcm_due : (time + FM_PERIOD - 1) / FM_PERIOD;
+	const size_t frames = (size_t)(out_due - mixed_until);
+	const size_t available = buffer->count / 2;
+	size_t count = (size_t)(pcm_due - buffer->first);
+	if (count > available)
+		count = available;
+
+	if (wide_channels && frames * wide_channels > wide_capacity)
+	{
+		int32_t *grown = realloc(wide_mix, frames * wide_channels * sizeof(*wide_mix));
+		if (!grown) { fputs("Out of memory for the effects mix\n", stderr); exit(3); }
+		wide_mix = grown;
+		wide_capacity = frames * wide_channels;
+	}
+	if (!wide_channels && frames * 2 > sound.mix_capacity)
+	{
+		int16_t *samples = realloc(sound.mix, frames * 2 * sizeof(*samples));
+		if (!samples)
+		{
+			fputs("Out of memory for the stereo mix\n", stderr);
+			exit(3);
+		}
+		sound.mix = samples;
+		sound.mix_capacity = frames * 2;
+	}
+
+	/* Same nearest-sample positions as floor(i * count / frames). */
+	size_t phase = 0, at = 0;
+	for (size_t i = 0; i < frames; ++i)
+	{
+		int32_t left = count ? buffer->data[2 * at + 1] : 0;
+		int32_t right = count ? buffer->data[2 * at] : 0;
+		if (wide_channels == 1)
+			wide_mix[i] = (left + right) * 7 / 20;
+		else if (compact_bank)
+		{
+			if (sides_together) left = right = left + right;
+			left = left * 7 / 20;
+			right = right * 7 / 20;
+			if (wide_channels)
+			{
+				wide_mix[2*i] = left;
+				wide_mix[2*i+1] = right;
+			}
+			else sound_compress_pair(&compressor_gain, &sound.mix[2*i], left, right);
+		}
+		else if (sides_together)
+		{
+			int16_t sample = (int16_t)((left + right) * 7 / 20);
+			sound.mix[2 * i] = sound.mix[2 * i + 1] = sample;
+		}
+		else
+		{
+			sound.mix[2 * i] = (int16_t)(left * 7 / 20);
+			sound.mix[2 * i + 1] = (int16_t)(right * 7 / 20);
+		}
+		phase += count;
+		while (phase >= frames)
+		{
+			phase -= frames;
+			++at;
+		}
+	}
+
+	buffer->count -= 2 * count;
+	if (buffer->count)
+		memmove(buffer->data, buffer->data + 2 * count, buffer->count * sizeof(*buffer->data));
+	buffer->first += count;
+	sound.mix_frames = frames;
+	mixed_until = out_due;
+}
+
 void sound_chips_end_frame(uint64_t time)
 {
 	uint64_t hash = 0xcbf29ce484222325ull;
 
 	fm_catch_up(time);
 	pcm_catch_up(time);
+	if (pcm_playback)
+	{
+		mix_pcm_playback(time);
+		return;
+	}
 	hash = take(&sound.fm_buffer, (time + FM_PERIOD - 1) / FM_PERIOD, hash, 0);
 	sound.frame_hash = take(&sound.pcm_buffer, (time + PCM_PERIOD - 1) / PCM_PERIOD, hash, 1);
 	mix();
@@ -315,13 +468,13 @@ const int32_t *sound_chips_frame_samples(int chip, size_t *count)
 const int16_t *sound_chips_frame_mix(size_t *frames)
 {
 	if (frames)
-		*frames = sound.mix_frames;
-	return sound.mix;
+		*frames = wide_channels ? 0 : sound.mix_frames;
+	return wide_channels ? NULL : sound.mix;
 }
 
 uint32_t sound_chips_mix_rate(void)
 {
-	return S32_SOUND_CLOCK / 144;
+	return compact_bank ? MULTIPCM_COMPACT_RATE : S32_SOUND_CLOCK / 144;
 }
 
 void sound_chips_join_sides(bool together)
@@ -331,8 +484,13 @@ void sound_chips_join_sides(bool together)
 
 void sound_chips_attach(void)
 {
+	pcm_playback = false;
+	compact_bank = NULL;
+	wide_channels = 0;
+	compact_pcm.arrange_stereo = false;
+	sound.fm_buffer.count = sound.pcm_buffer.count = sound.mix_frames = 0;
 	memset(&sound.fm, 0, sizeof(sound.fm));
-	sound.deadline[0] = sound.deadline[1] = NO_TIMER;
+	sound_next_timer = sound.deadline[0] = sound.deadline[1] = NO_TIMER;
 	sound.fm.host = NULL;
 	sound.fm.set_timer = fm_set_timer;
 	sound.fm.update_irq = fm_update_irq;
@@ -347,4 +505,39 @@ void sound_chips_attach(void)
 	s32_board.chips.fm_write = fm_write;
 	s32_board.chips.pcm_read = pcm_read;
 	s32_board.chips.pcm_write = pcm_write;
+}
+
+void sound_chips_attach_pcm_playback(void)
+{
+	sound_chips_attach();
+	mixed_until = 0;
+	pcm_playback = true;
+}
+
+void sound_chips_attach_pcm22(const int8_t *bank)
+{
+	sound_chips_attach_pcm_playback();
+	compact_bank = bank;
+	compact_pcm.phase = 0;
+	compact_pcm.page[0] = bank;
+	compact_pcm.page[1] = bank + 0x40000;
+	compressor_gain = 16384;
+}
+
+void sound_chips_wide_output(bool enable, bool arrange_music)
+{
+	wide_channels = enable && compact_bank ? 2 : 0;
+	compact_pcm.arrange_stereo = arrange_music;
+}
+
+void sound_chips_mono_effects(void)
+{
+	wide_channels = compact_bank ? 1 : 0;
+	compact_pcm.arrange_stereo = false;
+}
+
+const int32_t *sound_chips_wide_mix(size_t *frames)
+{
+	*frames = wide_channels ? sound.mix_frames : 0;
+	return wide_mix;
 }

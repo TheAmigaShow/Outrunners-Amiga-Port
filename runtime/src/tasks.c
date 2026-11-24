@@ -82,6 +82,64 @@ void host_task_switch(host_task *to)
 	SwitchToFiber(to->fiber);
 }
 
+#elif defined(ORUNNERS_AMIGA)
+
+struct host_task
+{
+	void *stack;
+};
+
+static host_task main_task;
+static host_task *current = &main_task;
+
+extern void amiga_switch_stacks(void **from, void *to);
+
+host_task *host_task_main(void)
+{
+	return &main_task;
+}
+
+static void task_returned(void)
+{
+	fprintf(stderr, "A task came to its end\n");
+	exit(3);
+}
+
+host_task *host_task_create(void (*start)(void))
+{
+	const size_t stack_size = 128u << 10;
+	host_task *task = malloc(sizeof(*task));
+	uint32_t *stack = calloc(1, stack_size);
+
+	if (!task || !stack)
+	{
+		fprintf(stderr, "Could not allocate a game stack in Fast RAM\n");
+		exit(3);
+	}
+
+	/* The switch restores d2-d7/a2-a6, then rts enters start. */
+	stack += stack_size / sizeof(*stack);
+	*--stack = (uintptr_t)task_returned;
+	*--stack = (uintptr_t)start;
+#ifdef __mc68060__
+	/* The full 060 additionally keeps FPCR and the six callee-saved extended registers. */
+	stack -= 1 + 6 * 3;
+#endif
+	task->stack = stack - 11;
+	return task;
+}
+
+void host_task_switch(host_task *to)
+{
+	host_task *from = current;
+
+	if (to != from)
+	{
+		current = to;
+		amiga_switch_stacks(&from->stack, to->stack);
+	}
+}
+
 #elif defined(__aarch64__) && (defined(__SWITCH__) || defined(__ANDROID__))
 
 /* The Switch's C library and Android's have no ucontext: a task's registers are kept on its own stack. What

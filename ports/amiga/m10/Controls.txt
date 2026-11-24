@@ -1,0 +1,8 @@
+Extract beside assets and launch Play Pad4 RTG or Play Pad4 AGA.
+Follow the first-run prompts, pressing and releasing one button at a time.
+A accelerates. B brakes. L shifts down. R shifts up. X inserts a coin.
+Y switches radio mode. Press the centre button assigned in setup to start after inserting a coin.
+If Menu is reserved by the emulator, use the centre button mapped to CD32 Play.
+D-pad left/right steers and up/down selects previous/next song.
+Select Manual in the game for shoulder shifting. Both launchers use the
+same A500Pad.map in the game folder. Delete this file to relearn the pad.

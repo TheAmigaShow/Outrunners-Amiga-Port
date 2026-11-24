@@ -41,6 +41,7 @@ extern const size_t game_table_count;
 /* Loads the assets in 'folder' (the extractor's assets/) and sets every table's pointer: NULL, or what
    failed, in words for the player */
 const char *assets_load(const char *folder);
+const char *assets_load_with_progress(const char *folder, void (*progress)(const char *));
 
 /* The data at an address of the program's data the game holds (a pointer it keeps): the piece's bytes
    there. The board decodes the program's chips more than once (the code's four times below 0x100000, the
@@ -81,6 +82,9 @@ const s32_graphics *assets_graphics(void);
 /* A byte of the MultiPCM's 4 MB from the samples and their headers, by its place: 0xFF where no sample is
    (for the board's sound: s32_board.pcm_at) */
 uint8_t assets_pcm_byte(uint32_t place);
+
+/* Load the optional signed, half-rate Amiga bank. The caller owns the returned allocation. */
+int8_t *assets_load_pcm22(const char *folder);
 
 /* The assets as one file, the pack (the devices' builds and the tools that make their packages): written
    from the assets loaded (assets_load), and loaded in their place from its bytes ('bytes', 'size': kept by

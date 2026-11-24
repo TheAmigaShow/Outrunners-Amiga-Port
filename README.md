@@ -22,6 +22,10 @@ its assets out of it.
   <img src="docs/screenshots/two_players.png" width="65%" alt="2 PLAYERS: both seats in one race, side by side">
 </p>
 
+## Amiga 68060 edition
+
+For the single-player AGA and RTG release, see the [M10 installation and build guide](ports/amiga/m10/README.md).
+
 ## Playing it
 
 Download the package for Windows, Linux or macOS from the

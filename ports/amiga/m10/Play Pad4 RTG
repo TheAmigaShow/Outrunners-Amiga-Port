@@ -1,0 +1,6 @@
+Stack 65536
+Pad4Setup
+If WARN
+  Quit 10
+EndIf
+Pad4Audio RTG

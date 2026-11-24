@@ -87,6 +87,8 @@ typedef struct multipcm
 	uint8_t (*read)(uint32_t address);    /* a byte of the sample ROM, 22 bits of address */
 	float rate;                           /* samples a second */
 	multipcm_voice voices[MULTIPCM_VOICES];
+	/* Slot MULTIPCM_VOICES is the list head and also the end sentinel. */
+	uint8_t next_active[MULTIPCM_VOICES + 1];
 	int current_voice;
 	uint8_t address;
 } multipcm;
@@ -99,6 +101,19 @@ void multipcm_reset(multipcm *chip);
    register; the chip reads back 0 */
 void multipcm_write(multipcm *chip, int offset, uint8_t data);
 uint8_t multipcm_read(multipcm *chip);
+
+/* Reduced-rate playback retains original ROM addresses, pitch and envelope ticks.
+   Each 512 KiB bank window maps to 256 KiB of prefiltered signed samples. */
+#define MULTIPCM_COMPACT_RATE 22050
+typedef struct multipcm_compact
+{
+	const int8_t *page[4];
+	bool arrange_stereo;
+	uint32_t phase;
+} multipcm_compact;
+
+int multipcm_generate_compact(multipcm *chip, multipcm_compact *compact,
+	int32_t *left, int32_t *right, int native_ticks);
 
 /* The next 'count' samples of each output, between -32768 and 32767 */
 void multipcm_generate(multipcm *chip, int32_t *left, int32_t *right, int count);

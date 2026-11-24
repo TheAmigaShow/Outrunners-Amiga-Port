@@ -239,7 +239,24 @@ static void envelope_calc(multipcm_voice *voice)
 	voice->reverb = false;
 }
 
-static int32_t envelope_update(multipcm_voice *voice)
+/* Keep playing voices in chip order. On removal, leave the slot's successor
+   intact so that a release ending inside generate() can finish this tick. */
+static void set_playing(multipcm *chip, int index, bool playing)
+{
+	uint8_t *link = &chip->next_active[MULTIPCM_VOICES];
+	while (*link < index)
+		link = &chip->next_active[*link];
+	if (playing)
+	{
+		chip->next_active[index] = *link;
+		*link = (uint8_t)index;
+	}
+	else
+		*link = chip->next_active[index];
+	chip->voices[index].playing = playing;
+}
+
+static int32_t envelope_update(multipcm *chip, int index, multipcm_voice *voice)
 {
 	switch (voice->state)
 	{
@@ -270,7 +287,7 @@ static int32_t envelope_update(multipcm_voice *voice)
 			if (voice->volume <= 0)
 			{
 				voice->volume = 0;
-				voice->playing = false;
+				set_playing(chip, index, false);
 			}
 			break;
 		default:
@@ -389,7 +406,8 @@ static void write_voice(multipcm *chip, multipcm_voice *voice, int reg, uint8_t 
 		case 4:    /* key on and off */
 			if (data & 0x80)
 			{
-				voice->playing = true;
+				if (!voice->playing)
+					set_playing(chip, chip->current_voice, true);
 				retrigger(voice);
 			}
 			else if (voice->playing)
@@ -397,7 +415,7 @@ static void write_voice(multipcm *chip, multipcm_voice *voice, int reg, uint8_t 
 				if (voice->release_reg != 0xf)
 					voice->state = RELEASE;
 				else
-					voice->playing = false;
+					set_playing(chip, chip->current_voice, false);
 			}
 			break;
 		case 5:    /* level, glided to or set */
@@ -437,6 +455,7 @@ static void write_voice(multipcm *chip, multipcm_voice *voice, int reg, uint8_t 
 void multipcm_init(multipcm *chip, uint32_t clock, uint8_t (*read)(uint32_t address))
 {
 	memset(chip, 0, sizeof(*chip));
+	chip->next_active[MULTIPCM_VOICES] = MULTIPCM_VOICES;
 	chip->read = read;
 	chip->rate = (float)clock / CLOCK_DIVIDER;
 	make_tables(chip->rate);
@@ -444,6 +463,7 @@ void multipcm_init(multipcm *chip, uint32_t clock, uint8_t (*read)(uint32_t addr
 
 void multipcm_reset(multipcm *chip)
 {
+	chip->next_active[MULTIPCM_VOICES] = MULTIPCM_VOICES;
 	for (int voice = 0; voice < MULTIPCM_VOICES; voice++)
 		chip->voices[voice].playing = false;
 }
@@ -479,44 +499,93 @@ static int32_t clamp(int32_t value)
 	return value < -32768 ? -32768 : (value > 32767 ? 32767 : value);
 }
 
-void multipcm_generate(multipcm *chip, int32_t *left, int32_t *right, int count)
+static int compact_byte(const multipcm_compact *compact, uint32_t address)
 {
+	return compact->page[(address >> 19) & 3][(address & 0x7ffff) >> 1];
+}
+
+/* The bank stores the even ROM addresses. Interpolate in original address
+   units, with the second tap wrapping to the instrument loop at its end. */
+static int compact_sample(const multipcm *chip, const multipcm_compact *compact,
+	const multipcm_voice *voice, uint32_t pos, int fraction)
+{
+	if (voice->end <= 2 || pos >= voice->end)
+		return (int8_t)chip->read((voice->start + pos) & 0x3fffff) * 256;
+	if (voice->reverse && fraction)
+	{
+		if (pos) { pos--; fraction = (1 << TL_SHIFT) - fraction; }
+		else fraction = 0;
+	}
+	const uint32_t address = voice->start + pos;
+	uint32_t first = address & ~1u;
+	if (first < voice->start)
+		return compact_byte(compact, first + 2) * 256;
+	uint32_t second = first + 2;
+	if (second >= voice->start + voice->end)
+	{
+		second = (voice->start + voice->loop + 1) & ~1u;
+		if (second >= voice->start + voice->end)
+			second = first;
+	}
+	const int lo = compact_byte(compact, first);
+	const int hi = compact_byte(compact, second);
+	const int phase = (int)(address & 1) * (1 << TL_SHIFT) + fraction;
+	return lo * 256 + (((hi - lo) * phase) >> (TL_SHIFT + 1 - 8));
+}
+
+static int generate(multipcm *chip, multipcm_compact *compact, int32_t *left, int32_t *right, int count)
+{
+	int output = 0;
 	for (int i = 0; i < count; ++i)
 	{
 		int32_t smpl = 0;
 		int32_t smpr = 0;
 
-		for (int index = 0; index < MULTIPCM_VOICES; ++index)
+		bool emit = true;
+		if (compact)
+		{
+			/* In units of the 10 MHz chip clock; one native tick is 224 clocks.
+			   Emit the native tick containing the next 22,050 Hz sample time. */
+			const uint32_t span = MULTIPCM_COMPACT_RATE * 224u;
+			emit = compact->phase < span;
+			if (emit) compact->phase += 10000000u;
+			compact->phase -= span;
+		}
+
+		for (int index = chip->next_active[MULTIPCM_VOICES]; index != MULTIPCM_VOICES; index = chip->next_active[index])
 		{
 			multipcm_voice *voice = &chip->voices[index];
 			uint32_t vol;
 			uint32_t spos;
 			uint32_t step;
-			int32_t csample;
+			int32_t csample = 0;
 			int32_t fpart;
 			int32_t sample;
 
-			if (!voice->playing)
-				continue;
 			vol = (voice->total_level >> TL_SHIFT) | (voice->pan << 7);
 			spos = voice->offset >> TL_SHIFT;
 			step = voice->step;
 			fpart = (int32_t)(voice->offset & ((1 << TL_SHIFT) - 1));
 			if (voice->reverse)
 				spos = voice->end - spos - 1;
-			if (voice->format & 4)    /* 12 bits: three bytes hold two samples */
-			{
-				const uint32_t address = voice->start + (spos >> 1) * 3;
-
-				if (!(spos & 1))
-					csample = (int16_t)(chip->read(address & 0x3fffff) << 8 | (chip->read((address + 1) & 0x3fffff) & 0xf) << 4);
-				else
-					csample = (int16_t)(chip->read((address + 2) & 0x3fffff) << 8 | (chip->read((address + 1) & 0x3fffff) & 0xf0));
-			}
+			if (compact && !(voice->format & 4))
+				sample = emit ? compact_sample(chip, compact, voice, spos, fpart) : 0;
 			else
-				csample = (int16_t)(chip->read((voice->start + spos) & 0x3fffff) << 8);
+			{
+				if (voice->format & 4)    /* 12 bits: three bytes hold two samples */
+				{
+					const uint32_t address = voice->start + (spos >> 1) * 3;
 
-			sample = (csample * fpart + voice->prev_sample * ((1 << TL_SHIFT) - fpart)) >> TL_SHIFT;
+					if (!(spos & 1))
+						csample = (int16_t)(chip->read(address & 0x3fffff) << 8 | (chip->read((address + 1) & 0x3fffff) & 0xf) << 4);
+					else
+						csample = (int16_t)(chip->read((address + 2) & 0x3fffff) << 8 | (chip->read((address + 1) & 0x3fffff) & 0xf0));
+				}
+				else
+					csample = (int16_t)(chip->read((voice->start + spos) & 0x3fffff) << 8);
+
+				sample = (csample * fpart + voice->prev_sample * ((1 << TL_SHIFT) - fpart)) >> TL_SHIFT;
+			}
 			if (voice->vibrato)
 			{
 				step = step * (uint32_t)lfo_step(&voice->pitch_lfo);
@@ -537,11 +606,35 @@ void multipcm_generate(multipcm *chip, int32_t *left, int32_t *right, int count)
 				sample = sample * lfo_step(&voice->amplitude_lfo);
 				sample >>= TL_SHIFT;
 			}
-			sample = (sample * envelope_update(voice)) >> 10;
+			const int32_t envelope = envelope_update(chip, index, voice);
+			if (!emit)
+				continue;
+			sample = (sample * envelope) >> 10;
+			/* The cabinet routes a player's music to one speaker. The offline
+			   stereo arrangement gives each instrument a stable, modest pan. */
+			if (compact && compact->arrange_stereo)
+			{
+				static const uint8_t pans[8] = { 0, 2, 14, 1, 15, 3, 13, 0 };
+				vol = (vol & 127) | ((unsigned)pans[(voice->start >> 5) & 7] << 7);
+			}
 			smpl += (tables.left_pan[vol] * sample) >> TL_SHIFT;
 			smpr += (tables.right_pan[vol] * sample) >> TL_SHIFT;
 		}
-		left[i] = clamp(smpl);
-		right[i] = clamp(smpr);
+		if (emit)
+		{
+			left[output] = compact ? smpl : clamp(smpl);
+			right[output++] = compact ? smpr : clamp(smpr);
+		}
 	}
+	return output;
+}
+
+void multipcm_generate(multipcm *chip, int32_t *left, int32_t *right, int count)
+{
+	generate(chip, 0, left, right, count);
+}
+
+int multipcm_generate_compact(multipcm *chip, multipcm_compact *compact, int32_t *left, int32_t *right, int count)
+{
+	return generate(chip, compact, left, right, count);
 }

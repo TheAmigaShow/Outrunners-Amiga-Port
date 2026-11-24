@@ -1064,7 +1064,7 @@ uint32_t race_entries_update(uint32_t entry_place)
 	uint32_t zero = 0;
 	uint8_t entrant = 0, entrants = 0, entry_serial = 0;
 	uint16_t next_entry_frames = 0, record_size = 0;
-	uint32_t entrant_count = 0, entry_frames = 0, machines = 0, player = 0, players_left = 0;
+	uint32_t entrant_count = 0, entry_frames = 0, player = 0, players_left = 0;
 	struct race *other_race = NULL, *race = NULL, *race_2 = NULL, *request = NULL;
 	struct screen *entrant_list = NULL;
 	uint8_t game_over = 0;
@@ -1089,10 +1089,13 @@ uint32_t race_entries_update(uint32_t entry_place)
 		{
 			if (entry_frames == 0u)
 			{
-				machines = 0u;
-				if (game->stand_alone == 0u)
-					machines = game->machine_count;
+#ifdef ORUNNERS_AMIGA
+				/* Publish the solo entrant, then close entries on the next update. */
+				next_entry_frames = 1u;
+#else
+				uint32_t machines = game->stand_alone ? 0u : game->machine_count;
 				next_entry_frames = entry_frames_by_machines[machines];
+#endif
 				request = race_2;
 				players_left = game->player_count;
 				player = 0u;

@@ -32,6 +32,7 @@
 #include "png.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -233,6 +234,16 @@ static uint32_t sprite_word(uint32_t place)
 	return block < sprite_block_count ? sprite_blocks[block].words[place - sprite_blocks[block].first] : 0xffffffffu;
 }
 
+static const uint32_t *sprite_span(uint32_t first, unsigned length)
+{
+	if (length > 0x100000u - (first & 0xfffff)) return NULL;
+	const size_t index = block_of(first);
+	if (index == sprite_block_count) return NULL;
+	const sprite_block *block = &sprite_blocks[index];
+	const uint32_t offset = first - block->first;
+	return length <= block->count - offset ? block->words + offset : NULL;
+}
+
 /* The pieces of the sheet 'name' (its JSON) added to 'pieces' */
 static int sheet_pieces(const char *folder, const char *name, int sheet, sprite_piece **pieces, size_t *count,
 	size_t *room)
@@ -299,7 +310,7 @@ static int sheet_pieces(const char *folder, const char *name, int sheet, sprite_
 	return 1;
 }
 
-int assets_read_sprites(const char *folder)
+int assets_read_sprites(const char *folder, void (*progress)(const char *))
 {
 	char *list = assets_read_file(assets_path(folder, "sprites/sheets.txt"));
 	char *cursor = list;
@@ -369,6 +380,12 @@ int assets_read_sprites(const char *folder)
 		png_image image;
 		const char *wrong;
 
+		if (progress && (sheet % 16 == 0 || sheet + 1 == sheet_count))
+		{
+			char message[80];
+			snprintf(message, sizeof(message), "Preparing sprite sheet %d of %d", sheet + 1, sheet_count);
+			progress(message);
+		}
 		snprintf(png_path, sizeof(png_path), "sprites/%s.png", names[sheet]);
 		if ((wrong = png_read(assets_path(folder, png_path), &image)) != NULL)
 		{
@@ -707,6 +724,27 @@ int assets_read_samples(const char *folder)
 	return 1;
 }
 
+int8_t *assets_load_pcm22(const char *folder)
+{
+	FILE *file = fopen(assets_path(folder, "sound/pcm22.bin"), "rb");
+	char header[8];
+	int8_t *bank = NULL;
+	if (!file)
+		return NULL;
+	if (fread(header, 1, sizeof(header), file) == sizeof(header) && !memcmp(header, "ORPCM22\1", 8))
+		bank = malloc(PCM_SIZE / 2);
+	if (bank && (fread(bank, 1, PCM_SIZE / 2, file) != PCM_SIZE / 2 || fgetc(file) != EOF || ferror(file)))
+	{
+		free(bank);
+		bank = NULL;
+	}
+	fclose(file);
+	/* Only a missing file permits automatic fallback to the original assets. */
+	if (!bank)
+		errno = EINVAL;
+	return bank;
+}
+
 uint8_t assets_pcm_byte(uint32_t place)
 {
 	size_t low = 0, high = pcm_block_count;
@@ -818,6 +856,7 @@ const s32_graphics *assets_graphics(void)
 	graphics.tile_pens = tile_pens;
 	graphics.tile_count = TILE_COUNT;
 	graphics.sprite_word = sprite_word;
+	graphics.sprite_span = sprite_span;
 	graphics.sprite_banks = 4;
 	return &graphics;
 }
